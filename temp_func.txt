@@ -1,0 +1,213 @@
+function generateAutoRoute() {
+  const progressEl = document.getElementById('auto-route-progress');
+  const resultCountEl = document.getElementById('auto-route-result-count');
+  if (progressEl) progressEl.classList.add('show');
+  if (resultCountEl) resultCountEl.textContent = '';
+
+  try {
+    if (!ensureLeaflet()) { alert('Map features are unavailable while offline.'); return; }
+    if (pins.length < 2) { alert('Need at least 2 pins to generate routes.'); if (progressEl) progressEl.classList.remove('show'); return; }
+
+    const startIdx = parseInt(document.getElementById('auto-route-start-pin')?.value);
+    const endIdx = parseInt(document.getElementById('auto-route-end-pin')?.value);
+    if (isNaN(startIdx) || isNaN(endIdx)) { alert('Please select a start pin and an end pin.'); if (progressEl) progressEl.classList.remove('show'); return; }
+    if (startIdx === endIdx) { alert('Start and end pins must be different.'); if (progressEl) progressEl.classList.remove('show'); return; }
+
+    const startPin = pins[startIdx];
+    const endPin = pins[endIdx];
+    const numRoutes = parseInt(document.getElementById('auto-route-count')?.value) || 3;
+    const targetDistance = parseFloat(document.getElementById('auto-route-target-distance')?.value) || 5.0;
+    const prefix = (document.getElementById('auto-route-name-prefix')?.value || 'Auto Route').trim();
+
+    // Build pool of intermediate pins (all pins except start & end)
+    const pool = pins.filter((p, i) => i !== startIdx && i !== endIdx);
+    if (pool.length < 1) { alert('Need at least one intermediate pin between start and end.'); if (progressEl) progressEl.classList.remove('show'); return; }
+
+    // Direct distance from start to end
+    const directDist = distanceBetween(startPin.lat, startPin.lon, endPin.lat, endPin.lon);
+
+    const createdRoutes = [];
+    const usedRouteColors = ROUTE_COLORS.slice();
+    const tolerance = 0.10; // ±10% tolerance on target distance
+
+    // Create N distinct routes
+    for (let r = 0; r < numRoutes; r++) {
+      // Clone the pool and shuffle it with a seed influenced by route index for diversity
+      let candidatePool = [...pool];
+      // Fisher-Yates shuffle with route-dependent seed
+      for (let s = candidatePool.length - 1; s > 0; s--) {
+        const seed = (s * 9301 + r * 49297 + 233280) % 233280;
+        const j = seed % (s + 1);
+        [candidatePool[s], candidatePool[j]] = [candidatePool[j], candidatePool[s]];
+      }
+
+      // Greedy selection: pick pins that make projected total closest to target
+      const selected = [];
+      let accumulatedDist = 0; // distance from startPin through selected pins to prevPt
+      let prevPt = startPin;
+      let bestProjectedRoute = null;
+      let bestProjectedDelta = Infinity;
+
+      while (candidatePool.length > 0) {
+        let bestIdx = -1;
+        let bestDelta = Infinity;
+
+        for (let ci = 0; ci < candidatePool.length; ci++) {
+          const cp = candidatePool[ci];
+          const segDist = distanceBetween(prevPt.lat, prevPt.lon, cp.lat, cp.lon);
+          const finalLeg = distanceBetween(cp.lat, cp.lon, endPin.lat, endPin.lon);
+          // projected total route distance if we use cp as last intermediate
+          const projectedTotal = accumulatedDist + segDist + finalLeg;
+          const delta = Math.abs(projectedTotal - targetDistance);
+          const diversityFactor = r > 0 ? (0.85 + Math.random() * 0.3) : 1.0;
+          const weightedDelta = delta * diversityFactor;
+          if (weightedDelta < bestDelta) {
+            bestDelta = weightedDelta;
+            bestIdx = ci;
+          }
+        }
+
+        if (bestIdx === -1) break;
+
+        const chosen = candidatePool[bestIdx];
+        const segDist = distanceBetween(prevPt.lat, prevPt.lon, chosen.lat, chosen.lon);
+        const finalLeg = distanceBetween(chosen.lat, chosen.lon, endPin.lat, endPin.lon);
+        const projectedTotal = accumulatedDist + segDist + finalLeg;
+        const projectedDelta = Math.abs(projectedTotal - targetDistance);
+
+        // Track the best projected route so far (before adding this pin)
+        const routeWithCurrentSet = {
+          points: [startPin, ...selected, endPin],
+          projectedDelta: Math.abs(accumulatedDist + distanceBetween(prevPt.lat, prevPt.lon, endPin.lat, endPin.lon) - targetDistance)
+        };
+
+        // Update best before adding the chosen pin
+        if (routeWithCurrentSet.points.length >= 2 && routeWithCurrentSet.projectedDelta < bestProjectedDelta) {
+          bestProjectedRoute = routeWithCurrentSet.points.slice();
+          bestProjectedDelta = routeWithCurrentSet.projectedDelta;
+        }
+
+        // Add the chosen pin
+        accumulatedDist += segDist;
+        selected.push(chosen);
+        prevPt = chosen;
+        candidatePool.splice(bestIdx, 1);
+
+        // Evaluate if we should keep this pin or revert
+        // Check if adding this pin made the projected total closer to target
+        // Also check if the projected total is already within tolerance
+        if (projectedDelta <= targetDistance * tolerance) {
+          // Within tolerance — accept as is and stop
+          break;
+        }
+
+        // If the projected total with this pin added is worse than WITHOUT the pin,
+        // revert the addition and stop
+        const withoutThisPin = accumulatedDist - segDist + distanceBetween(prevPt === chosen ? startPin : prevPt, prevPt === chosen ? startPin : prevPt, endPin.lat, endPin.lon);
+        // Actually simpler: compare projected total vs what it would be without this pin
+        // Projected without: accumulatedDist_before + dist(prevPt_before → endPin)
+        // accumulatedDist_before = accumulatedDist - segDist
+        // prevPt_before = selected[selected.length-2] || startPin
+        const prevPtBefore = selected.length >= 2 ? selected[selected.length-2] : startPin;
+        const distBeforeToEnd = distanceBetween(prevPtBefore.lat, prevPtBefore.lon, endPin.lat, endPin.lon);
+        const projectedWithout = (accumulatedDist - segDist) + distBeforeToEnd;
+
+        // If adding the pin makes projected total FURTHER from target AND we have at least 1 intermediate,
+        // revert and stop
+        if (selected.length >= 1 && Math.abs(projectedWithout - targetDistance) < Math.abs(projectedTotal - targetDistance)) {
+          selected.pop();
+          accumulatedDist -= segDist;
+          prevPt = selected.length > 0 ? selected[selected.length-1] : startPin;
+          break;
+        }
+
+        // If we already have accumulated extra distance that makes final projected exceed target * 1.3, stop
+        if (projectedTotal > targetDistance * 1.3) {
+          break;
+        }
+      }
+
+      // Also check the route ending at the last selected pin (without any further additions)
+      // This was already tracked as bestProjectedRoute above
+
+      // Build the route: use bestProjectedRoute if better than the final selected set
+      let routePoints;
+      if (bestProjectedRoute && bestProjectedDelta < Math.abs(accumulatedDist + distanceBetween(prevPt.lat, prevPt.lon, endPin.lat, endPin.lon) - targetDistance)) {
+        routePoints = bestProjectedRoute;
+      } else {
+        routePoints = [startPin, ...selected, endPin];
+      }
+
+      const latlngs = routePoints.map(p => L.latLng(p.lat, p.lon));
+
+      // Calculate total distance for this route
+      let totalMeters = 0;
+      for (let i = 1; i < latlngs.length; i++) totalMeters += map.distance(latlngs[i-1], latlngs[i]);
+      const totalKm = totalMeters / 1000;
+
+      const routeName = `${prefix} ${routes.length + createdRoutes.length + 1}`;
+      const routeColor = usedRouteColors[createdRoutes.length % usedRouteColors.length];
+      const routeLayer = L.polyline(latlngs, { color: routeColor, weight: 4, dashArray: '8 4', opacity: 0.9 });
+
+      const route = {
+        id: `route-${Date.now()}-${r}`,
+        name: routeName,
+        color: routeColor,
+        group: autoRouteGroup || '',
+        visible: true,
+        showRouteLabel: true,
+        showPointNames: routePointLabelsVisible,
+        points: routePoints,
+        totalDistance: totalKm.toFixed(2),
+        totalKm,
+        estimatedDayMinutes: totalKm * MINUTES_PER_KM_DAY,
+        estimatedNightMinutes: totalKm * MINUTES_PER_KM_NIGHT,
+        layer: routeLayer
+      };
+      createdRoutes.push(route);
+    }
+
+    // Add all created routes to the routes array
+    createdRoutes.forEach(route => {
+      routes.push(route);
+      syncRouteVisuals(route);
+    });
+
+    // Build detailed result feedback
+    const resultDetails = createdRoutes.map((route, i) => {
+      const diff = (route.totalKm - targetDistance);
+      const sign = diff >= 0 ? '+' : '';
+      return `${route.name}: ${route.totalDistance} km (${sign}${diff.toFixed(2)} km from target)`;
+    }).join('\n');
+
+    if (resultCountEl) {
+      resultCountEl.textContent = `✓ Created ${createdRoutes.length} routes from "${startPin.name||'Start'}" to "${endPin.name||'End'}"`;
+      resultCountEl.style.whiteSpace = 'pre-line';
+      // Add a tooltip-like extra info
+      const infoEl = document.createElement('div');
+      infoEl.style.cssText = 'font-size:9px;color:var(--accent2);margin-top:8px;line-height:1.6;text-align:left';
+      infoEl.textContent = resultDetails;
+      resultCountEl.appendChild(infoEl);
+    }
+    if (progressEl) progressEl.classList.remove('show');
+
+    renderHistory();
+
+    // Auto-open pin sheet if closed
+    if (!pinSheetOpen) togglePinSheet();
+
+    // Fit map to show all generated routes
+    if (mapReady && createdRoutes.length > 0) {
+      const allLayers = createdRoutes.map(r => r.layer);
+      const group = L.featureGroup(allLayers);
+      map.fitBounds(group.getBounds().pad(0.1), { padding: [30, 30] });
+    }
+
+    // Close modal after short delay
+    setTimeout(() => closeAutoRouteGenerator(), 1500);
+
+  } catch (e) {
+    if (progressEl) progressEl.classList.remove('show');
+    alert('Auto route error: ' + e.message);
+  }
+}
